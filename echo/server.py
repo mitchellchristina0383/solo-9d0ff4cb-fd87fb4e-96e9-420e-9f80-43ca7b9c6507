@@ -6,19 +6,33 @@
 - 断线：``down`` 为真时丢弃所有包。
 
 行为以**收到包那一刻**的配置为准（延迟期间改配置不影响已入队的包）。
+
+另外提供**分段演练**（``POST /drill``）：对同一条线路按时间表依次执行
+“断线 / 指定回包延迟”，最多 8 段。演练状态先落盘再生效，重启后按绝对时间
+表续跑（停机时间照算、已过段直接跳过）。详见 :mod:`app.drill`。
+
 运行方式：``python -m echo.server``（参数走环境变量，见文件底部 main）。
 """
 from __future__ import annotations
 
 import asyncio
 import os
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+from typing import Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app.config import MAX_UDP_PAYLOAD
+from app.drill import (
+    DrillActive,
+    DrillManager,
+    DrillNotFound,
+    DrillPersistError,
+    DrillRequest,
+)
 
 
 @dataclass
@@ -37,11 +51,22 @@ class LineStats:
 
 
 class EchoProtocol(asyncio.DatagramProtocol):
-    """逐字节回显；按收到时刻的配置决定丢包/延迟。"""
+    """逐字节回显；按收到时刻的配置决定丢包/延迟。
 
-    def __init__(self, cfg: LineConfig, stats: LineStats) -> None:
+    ``effective`` 为可选的同步钩子（演练用）：收到包时调用一次，返回那一刻
+    应生效的 ``down``/``delay_ms``/``max_size``；返回 None 时沿用 ``cfg``。
+    延迟回包用 ``call_later`` 独立排队，后续改配置或切段都不会取消它。
+    """
+
+    def __init__(
+        self,
+        cfg: LineConfig,
+        stats: LineStats,
+        effective: Callable[[], dict | None] | None = None,
+    ) -> None:
         self.cfg = cfg
         self.stats = stats
+        self.effective = effective
         self.transport: asyncio.DatagramTransport | None = None
 
     def connection_made(self, transport) -> None:  # noqa: ANN001
@@ -49,13 +74,17 @@ class EchoProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
         self.stats.received += 1
-        if self.cfg.down:
+        view = self.effective() if self.effective is not None else None
+        down = self.cfg.down if view is None else bool(view["down"])
+        max_size = self.cfg.max_size if view is None else int(view["max_size"])
+        delay_ms = self.cfg.delay_ms if view is None else int(view["delay_ms"])
+        if down:
             self.stats.dropped_down += 1
             return
-        if len(data) > self.cfg.max_size:
+        if len(data) > max_size:
             self.stats.dropped_oversize += 1
             return
-        delay_s = self.cfg.delay_ms / 1000
+        delay_s = delay_ms / 1000
         asyncio.get_running_loop().call_later(delay_s, self._echo, data, addr)
 
     def _echo(self, data: bytes, addr) -> None:  # noqa: ANN001
@@ -81,27 +110,43 @@ def create_echo_app(
     max_size: int = MAX_UDP_PAYLOAD,
     delay_ms: int = 0,
     down: bool = False,
+    drill_state_path: str | os.PathLike[str] | None = None,
 ) -> FastAPI:
-    """构造一条回显线路：控制口随 HTTP 服务启动，UDP 口在 lifespan 内绑定。"""
+    """构造一条回显线路：控制口随 HTTP 服务启动，UDP 口在 lifespan 内绑定。
+
+    ``drill_state_path`` 为演练状态文件；为 None 时默认放在系统临时目录下，
+    按线路名区分（测试可显式传入临时路径）。
+    """
     cfg = LineConfig(max_size=max_size, delay_ms=delay_ms, down=down)
     stats = LineStats()
+    state_path = drill_state_path or (
+        os.path.join(
+            os.environ.get("DRILL_STATE_DIR", "/tmp/udp-line-drills"),
+            f"drill-{line_name}.json",
+        )
+    )
+    drills = DrillManager(line=line_name, cfg=cfg, state_path=state_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
-            lambda: EchoProtocol(cfg, stats), local_addr=(udp_host, udp_port)
+            lambda: EchoProtocol(cfg, stats, lambda: drills.effective_at(time.time())),
+            local_addr=(udp_host, udp_port),
         )
         app.state.udp_port = transport.get_extra_info("sockname")[1]
+        await drills.startup()  # 重启续跑 / 停机期间到期则恢复开场前设置
         try:
             yield
         finally:
+            await drills.close()
             transport.close()
 
     app = FastAPI(title=f"回显线路 {line_name}", lifespan=lifespan)
     app.state.cfg = cfg
     app.state.stats = stats
     app.state.line_name = line_name
+    app.state.drills = drills
 
     @app.get("/health")
     async def health() -> dict:
@@ -113,8 +158,10 @@ def create_echo_app(
 
     @app.post("/config")
     async def set_config(patch: ConfigPatch) -> dict:
-        for key, value in patch.model_dump(exclude_none=True).items():
-            setattr(cfg, key, value)
+        try:
+            await drills.update_config(patch.model_dump(exclude_none=True))
+        except DrillActive as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         return {"line": line_name, **asdict(cfg)}
 
     @app.get("/stats")
@@ -126,6 +173,31 @@ def create_echo_app(
         stats.received = stats.echoed = 0
         stats.dropped_oversize = stats.dropped_down = 0
         return {"line": line_name, **asdict(stats)}
+
+    @app.post("/drill", status_code=202)
+    async def start_drill(req: DrillRequest) -> dict:
+        """按时间表开始一轮演练；同线已有演练时 409，落盘失败则不开始。"""
+        try:
+            return await drills.start(req.segments)
+        except DrillActive as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except DrillPersistError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+    @app.get("/drill")
+    async def get_drill() -> dict:
+        """当前段、整轮结束时间与各段明细；无演练时 status 为 none。"""
+        return await drills.status()
+
+    @app.delete("/drill")
+    async def cancel_drill() -> dict:
+        """提前结束演练并恢复开场前设置；没有进行中的演练时 404。"""
+        try:
+            return await drills.cancel()
+        except DrillNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except DrillPersistError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
 
     return app
 
@@ -140,6 +212,7 @@ def main() -> None:
         max_size=int(os.environ.get("MAX_SIZE", str(MAX_UDP_PAYLOAD))),
         delay_ms=int(os.environ.get("DELAY_MS", "0")),
         down=os.environ.get("DOWN", "").lower() in {"1", "true", "yes"},
+        drill_state_path=os.environ.get("DRILL_STATE_PATH") or None,
     )
     uvicorn.run(
         app,

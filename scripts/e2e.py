@@ -2,7 +2,8 @@
 """端到端自测脚本（仅用标准库）：对运行中的服务栈做完整场景核对。
 
 覆盖：超长丢包二分测量、探测次数对数级、切线即撤建议、断线无法判定、
-测量中切线作废、切回原线路也只认切换后的测量、/docs 可用。
+测量中切线作废、切回原线路也只认切换后的测量、/docs 可用，以及回显线路
+分段演练：落盘/查询、跨段回包、互斥、到期恢复。
 
 用法：
     python3 scripts/e2e.py --base http://127.0.0.1:8000
@@ -12,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 import sys
 import time
 import urllib.error
@@ -63,6 +66,103 @@ def measure(base: str, lower: int, upper: int, timeout_ms: int = 300) -> dict:
     )
     assert status == 202, f"发起测量失败: {status} {rec}"
     return wait_done(base, rec["id"])
+
+
+def wait_drill(base: str, line: str, *, status: str | None = None,
+               segment: int | None = None, timeout_s: float = 10.0) -> dict:
+    deadline = time.time() + timeout_s
+    body = None
+    while time.time() < deadline:
+        _, body = api(base, "GET", f"/api/lines/{line}/drill")
+        if status is not None and body["status"] == status:
+            return body
+        if (
+            segment is not None
+            and body["status"] == "running"
+            and body["current_segment"] == segment
+        ):
+            return body
+        time.sleep(0.05)
+    raise TimeoutError(f"等待演练条件超时: {body}")
+
+
+def udp_probe(port: int, payload: bytes, first_wait_s: float, second_wait_s: float):
+    """发一个包，先短等看是否有立即回包，再长等跨段回包。
+
+    返回 ``(immediate, later)``：立即回包是否存在、随后是否收到同一载荷。
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(first_wait_s)
+    try:
+        sock.sendto(payload, ("127.0.0.1", port))
+        try:
+            data, _ = sock.recvfrom(65535)
+            return data == payload, False
+        except socket.timeout:
+            pass
+        sock.settimeout(second_wait_s)
+        try:
+            data, _ = sock.recvfrom(65535)
+        except socket.timeout:
+            return False, False
+        return False, data == payload
+    finally:
+        sock.close()
+
+
+def run_drill_scenarios(base: str) -> None:
+    print("== 8. 分段演练：先落盘、查询当前段与整轮结束时间 ==")
+    _, body = api(base, "POST", "/api/lines/a/drill", {
+        "segments": [
+            {"duration_s": 1.5, "delay_ms": 800},
+            {"duration_s": 3.0, "down": True},
+            {"duration_s": 1.0, "delay_ms": 50},
+        ]
+    })
+    check("演练启动返回 running", body["status"] == "running",
+          f"status={body['status']}")
+    check("当前段为第 1 段（延迟 800ms）",
+          body["current_segment"] == 1 and body["current"]["delay_ms"] == 800)
+    check("整轮结束时间 = 开始 + 5.5s",
+          abs((body["ends_at_epoch"] - body["started_at_epoch"]) - 5.5) < 0.01,
+          f"ends_at={body['ends_at']}")
+    check("开场前设置已记录（1500B/30ms/未断线）",
+          body["baseline"] == {"max_size": 1500, "delay_ms": 30, "down": False},
+          str(body["baseline"]))
+
+    print("== 9. 跨段回包：延迟段入队的回包在断线段照原决定发出 ==")
+    payload = b"e2e-cross-segment-" + str(os.getpid()).encode()
+    immediate, later = udp_probe(9001, payload, first_wait_s=0.4, second_wait_s=0.6)
+    check("延迟段内没有立即回包", immediate is False)
+    check("回包在断线段内仍到达（跨段照原决定发送）", later is True)
+    body = wait_drill(base, "a", segment=2)
+    check("此刻已进入第 2 段（断线）", body["current"]["down"] is True,
+          f"current_segment={body['current_segment']}")
+    dropped_immediate, dropped_later = udp_probe(
+        9001, b"e2e-down-segment", first_wait_s=0.3, second_wait_s=0.3
+    )
+    check("断线段内新到的包被丢弃", dropped_immediate is False and dropped_later is False)
+
+    print("== 10. 演练互斥：同线改参数 / 再开一轮均拒绝 ==")
+    status, detail = api(base, "POST", "/api/lines/a/config", {"delay_ms": 7})
+    check("演练中改参数返回 409", status == 409, str(detail))
+    status, detail = api(base, "POST", "/api/lines/a/drill",
+                         {"segments": [{"duration_s": 1, "down": True}]})
+    check("演练中再开一轮返回 409", status == 409, str(detail))
+    status, detail = api(base, "POST", "/api/lines/a/drill",
+                         {"segments": [{"down": True}] * 9})
+    check("段数超过 8 被拒绝(422)", status == 422)
+
+    print("== 11. 到期恢复开场前线路设置 ==")
+    body = wait_drill(base, "a", status="completed", timeout_s=10.0)
+    check("演练到期结束", body["status"] == "completed", body["reason"])
+    _, cfg = api(base, "GET", "/api/lines")
+    cfg_a = {l["name"]: l for l in cfg}["a"]["config"]
+    check("线路设置恢复为开场前 (1500B/30ms/未断线)",
+          cfg_a == {"line": "a", "max_size": 1500, "delay_ms": 30, "down": False},
+          str(cfg_a))
+    status, _ = api(base, "POST", "/api/lines/a/config", {"delay_ms": 30})
+    check("演练结束后可以再改参数", status == 200)
 
 
 def main() -> int:
@@ -155,6 +255,8 @@ def main() -> int:
     check("线路 b 有断线丢包计数",
           by_name["b"]["reachable"] and by_name["b"]["stats"]["dropped_down"] > 0,
           f"dropped_down={by_name['b']['stats']['dropped_down']}")
+
+    run_drill_scenarios(base)
 
     failed = [item for item in RESULTS if not item[0]]
     print(f"\n汇总: {len(RESULTS) - len(failed)}/{len(RESULTS)} 项通过")

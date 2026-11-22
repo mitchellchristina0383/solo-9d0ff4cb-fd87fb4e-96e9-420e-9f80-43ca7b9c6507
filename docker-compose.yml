@@ -1,11 +1,14 @@
 # UDP 线路载荷测量服务：主服务 + 两条本地回显线路
 #
 #   docker compose up --build
-#   打开 http://localhost:8000/docs 演示测量与切线
+#   打开 http://localhost:8000/docs 演示测量、切线与分段演练
 #
 # 线路 a：窄线，超过 1500 字节的包丢弃，回包延迟 30ms
 # 线路 b：宽线，超过 4000 字节的包丢弃，回包延迟 80ms
 # 运行中可用 POST /api/lines/{name}/config 改参数（超长丢包/延迟/断线）。
+#
+# 分段演练（POST /api/lines/{name}/drill）的时间表落在命名卷里，因此
+# `docker compose restart echo-a` 或重建容器后仍按原时间表续跑（停机时间照算）。
 
 services:
   echo-a:
@@ -18,6 +21,9 @@ services:
       CTRL_PORT: "9101"
       MAX_SIZE: "1500"
       DELAY_MS: "30"
+      DRILL_STATE_PATH: /var/lib/udp-line-drills/a.json
+    volumes:
+      - drill-a:/var/lib/udp-line-drills
 
   echo-b:
     build: .
@@ -29,6 +35,9 @@ services:
       CTRL_PORT: "9102"
       MAX_SIZE: "4000"
       DELAY_MS: "80"
+      DRILL_STATE_PATH: /var/lib/udp-line-drills/b.json
+    volumes:
+      - drill-b:/var/lib/udp-line-drills
 
   app:
     build: .
@@ -45,3 +54,7 @@ services:
     depends_on:
       - echo-a
       - echo-b
+
+volumes:
+  drill-a:
+  drill-b:

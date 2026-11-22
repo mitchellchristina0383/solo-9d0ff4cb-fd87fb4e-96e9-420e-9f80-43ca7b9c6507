@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -27,8 +29,15 @@ async def raw_echo(max_size=65507, delay_ms=0, down=False):
 
 
 @asynccontextmanager
-async def full_echo(name, max_size=65507, delay_ms=0, down=False):
-    """起完整回显线路（UDP + HTTP 控制口），供 API 级测试使用。"""
+async def full_echo(name, max_size=65507, delay_ms=0, down=False, drill_state_path=None):
+    """起完整回显线路（UDP + HTTP 控制口），供 API 级测试使用。
+
+    ``drill_state_path`` 不传时使用独立临时文件，避免测试之间互相污染。
+    """
+    if drill_state_path is None:
+        drill_state_path = os.path.join(
+            tempfile.mkdtemp(prefix=f"drill-test-{name}-"), "drill.json"
+        )
     echo_app = create_echo_app(
         line_name=name,
         udp_host="127.0.0.1",
@@ -36,6 +45,7 @@ async def full_echo(name, max_size=65507, delay_ms=0, down=False):
         max_size=max_size,
         delay_ms=delay_ms,
         down=down,
+        drill_state_path=drill_state_path,
     )
     server = uvicorn.Server(
         uvicorn.Config(echo_app, host="127.0.0.1", port=0, log_level="error")
@@ -49,9 +59,11 @@ async def full_echo(name, max_size=65507, delay_ms=0, down=False):
             app=echo_app,
             cfg=echo_app.state.cfg,
             stats=echo_app.state.stats,
+            drills=echo_app.state.drills,
             udp_port=echo_app.state.udp_port,
             http_port=http_port,
             ctrl_url=f"http://127.0.0.1:{http_port}",
+            drill_state_path=drill_state_path,
         )
     finally:
         server.should_exit = True

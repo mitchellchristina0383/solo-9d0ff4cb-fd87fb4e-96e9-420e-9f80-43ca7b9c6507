@@ -1,4 +1,4 @@
-"""FastAPI 入口：测量、建议查询、切线、线路模拟参数代理。
+"""FastAPI 入口：测量、建议查询、切线、线路模拟参数与分段演练代理。
 
 - ``POST /api/measure``            发起一轮测量（后台执行，202 返回任务）
 - ``GET  /api/measurements/{id}``  查询测量进度与逐包事件
@@ -6,6 +6,9 @@
 - ``POST /api/line/switch``        切线：立即撤下旧建议并推进 epoch
 - ``GET  /api/lines``              两条回显线路的实时配置与统计
 - ``POST /api/lines/{name}/config`` 调整线路模拟参数（超长丢包/延迟/断线）
+- ``POST /api/lines/{name}/drill`` 在一条线路上开始分段演练（最多 8 段）
+- ``GET  /api/lines/{name}/drill`` 演练当前段与整轮结束时间
+- ``DELETE /api/lines/{name}/drill`` 提前结束演练并恢复开场前设置
 - ``GET  /docs``                   Swagger 交互式演示
 """
 from __future__ import annotations
@@ -18,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
 from .config import MAX_UDP_PAYLOAD, LineEndpoint, load_lines
+from .drill import DrillRequest
 from .state import (
     LineManager,
     Measurement,
@@ -49,6 +53,17 @@ class LineConfigPatch(BaseModel):
     )
     delay_ms: int | None = Field(default=None, ge=0, le=60_000, description="回包延迟")
     down: bool | None = Field(default=None, description="断线开关")
+
+
+def _upstream_detail(response: httpx.Response) -> str:
+    """把线路控制口的错误信息原样透传，便于值班员看清 409 的原因。"""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text or response.reason_phrase
+    if isinstance(payload, dict) and "detail" in payload:
+        return str(payload["detail"])
+    return str(payload)
 
 
 def measurement_view(rec: Measurement) -> dict:
@@ -87,7 +102,8 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
         description=(
             "采集线路改路后，值班员用本服务实测当前线路上可用的最大 UDP 载荷。"
             "二分探测，次数不随范围线性增长；支持两条本地回显线路切换，"
-            "可模拟超长丢包、回包延迟与断线。"
+            "可模拟超长丢包、回包延迟与断线，并可在一条线路上做先延迟、后断线"
+            "的分段演练（最多 8 段，先落盘再生效，重启后按原时间表续跑）。"
         ),
         lifespan=lifespan,
     )
@@ -149,16 +165,20 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
             "active": name == manager.active,
         }
         try:
-            cfg_resp, stats_resp = await asyncio.gather(
-                http.get(f"{ep.ctrl_url}/config"), http.get(f"{ep.ctrl_url}/stats")
+            cfg_resp, stats_resp, drill_resp = await asyncio.gather(
+                http.get(f"{ep.ctrl_url}/config"),
+                http.get(f"{ep.ctrl_url}/stats"),
+                http.get(f"{ep.ctrl_url}/drill"),
             )
             cfg_resp.raise_for_status()
             stats_resp.raise_for_status()
+            drill_resp.raise_for_status()
             return {
                 **base,
                 "reachable": True,
                 "config": cfg_resp.json(),
                 "stats": stats_resp.json(),
+                "drill": drill_resp.json(),
             }
         except Exception as exc:  # noqa: BLE001 - 线路控制口不可达也要能展示
             return {**base, "reachable": False, "error": str(exc)}
@@ -171,12 +191,7 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
 
     @app.post("/api/lines/{name}/config", summary="调整线路模拟参数")
     async def set_line_config(name: str, patch: LineConfigPatch) -> dict:
-        ep = manager.lines.get(name)
-        if ep is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"未知线路 {name!r}，可选: {sorted(manager.lines)}",
-            )
+        ep = _line_or_404(name)
         try:
             resp = await http.post(
                 f"{ep.ctrl_url}/config",
@@ -184,10 +199,54 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise HTTPException(status_code=exc.response.status_code, detail=str(exc))
+            raise HTTPException(
+                status_code=exc.response.status_code,
+                detail=_upstream_detail(exc.response),
+            )
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"线路控制口不可达: {exc}")
         return resp.json()
+
+    def _line_or_404(name: str) -> LineEndpoint:
+        ep = manager.lines.get(name)
+        if ep is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"未知线路 {name!r}，可选: {sorted(manager.lines)}",
+            )
+        return ep
+
+    async def _drill_proxy(name: str, method: str, body: dict | None = None) -> dict:
+        ep = _line_or_404(name)
+        try:
+            resp = await http.request(method, f"{ep.ctrl_url}/drill", json=body)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=exc.response.status_code,
+                detail=_upstream_detail(exc.response),
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"线路控制口不可达: {exc}")
+        return resp.json()
+
+    @app.post(
+        "/api/lines/{name}/drill",
+        status_code=202,
+        summary="开始分段演练（先落盘，后生效）",
+    )
+    async def start_drill(name: str, req: DrillRequest) -> dict:
+        return await _drill_proxy(
+            name, "POST", req.model_dump(exclude_none=True)
+        )
+
+    @app.get("/api/lines/{name}/drill", summary="演练当前段与整轮结束时间")
+    async def get_drill(name: str) -> dict:
+        return await _drill_proxy(name, "GET")
+
+    @app.delete("/api/lines/{name}/drill", summary="提前结束演练并恢复开场前设置")
+    async def cancel_drill(name: str) -> dict:
+        return await _drill_proxy(name, "DELETE")
 
     return app
 
