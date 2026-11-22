@@ -1,0 +1,47 @@
+# UDP 线路载荷测量服务：主服务 + 两条本地回显线路
+#
+#   docker compose up --build
+#   打开 http://localhost:8000/docs 演示测量与切线
+#
+# 线路 a：窄线，超过 1500 字节的包丢弃，回包延迟 30ms
+# 线路 b：宽线，超过 4000 字节的包丢弃，回包延迟 80ms
+# 运行中可用 POST /api/lines/{name}/config 改参数（超长丢包/延迟/断线）。
+
+services:
+  echo-a:
+    build: .
+    image: udp-line-measure
+    command: ["python", "-m", "echo.server"]
+    environment:
+      LINE_NAME: a
+      UDP_PORT: "9001"
+      CTRL_PORT: "9101"
+      MAX_SIZE: "1500"
+      DELAY_MS: "30"
+
+  echo-b:
+    build: .
+    image: udp-line-measure
+    command: ["python", "-m", "echo.server"]
+    environment:
+      LINE_NAME: b
+      UDP_PORT: "9002"
+      CTRL_PORT: "9102"
+      MAX_SIZE: "4000"
+      DELAY_MS: "80"
+
+  app:
+    build: .
+    image: udp-line-measure
+    ports:
+      - "8000:8000"
+    environment:
+      LINE_A_HOST: echo-a
+      LINE_A_UDP_PORT: "9001"
+      LINE_A_CTRL_URL: http://echo-a:9101
+      LINE_B_HOST: echo-b
+      LINE_B_UDP_PORT: "9002"
+      LINE_B_CTRL_URL: http://echo-b:9102
+    depends_on:
+      - echo-a
+      - echo-b
